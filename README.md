@@ -93,7 +93,7 @@ Set default RoCE **TOS** (Type of Service) and **TC** (traffic class) for the RD
 > __*Note:*__ `"args"` is optional. `"rdmaQoS"` is optional; include `tos` and/or `tc` as needed for your fabric QoS.
 
 ### RDMADeviceName (optional)
-Optional `rdmaDeviceName` (under `args.cni`) allow users to set custom RDMA device name. Upon `cmdDel` original RDMA device name will be restored.
+Optional `rdmaDeviceName` (under `args.cni`) allows users to set a custom RDMA device name inside the container. Upon `cmdDel` the original hardware RDMA device name will be restored.
 
 ```json
 {
@@ -107,7 +107,9 @@ Optional `rdmaDeviceName` (under `args.cni`) allow users to set custom RDMA devi
   }
 }
 ```
-> __*Note:*__ `rdmaDeviceName` is optional
+> __*Note:*__ `rdmaDeviceName` is optional.
+>
+> __*Note:*__ RDMA device names are **globally unique** in the kernel even in exclusive namespace mode. When `rdmaDeviceName` is set, the caller must ensure the name is unique across all pods on the same node. Using the same `rdmaDeviceName` in multiple pods will cause the second pod to fail with `file exists`.
 
 # Deployment
 

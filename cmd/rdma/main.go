@@ -51,16 +51,11 @@ var (
 )
 
 var (
-	version               = "master@git"
-	commit                = "unknown commit"
-	date                  = "unknown date"
-	skipRdmaDeviceRestore = false
+	version = "master@git"
+	commit  = "unknown commit"
+	date    = "unknown date"
 )
 
-const (
-	// prefix for RDMA device names in container namespace
-	rdmaDevPrefix = "rdma_"
-)
 
 type NsManager interface {
 	GetNS(string) (ns.NetNS, error)
@@ -229,8 +224,8 @@ func (plugin *rdmaCniPlugin) CmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
-	// Get RDMA device name from netdevice or CNI args
-	rdmaDev, origRdmaDev, err := plugin.getRDMADevice(conf.Args.CNI.RDMADeviceName, args.IfName, conf.DeviceID)
+	// Get RDMA device name (hardware name by default, or user-provided rdmaDeviceName)
+	rdmaDev, origRdmaDev, err := plugin.getRDMADevice(conf.Args.CNI.RDMADeviceName, conf.DeviceID)
 	if err != nil {
 		return fmt.Errorf("failed to get RDMA device for device ID %s: %w", conf.DeviceID, err)
 	}
@@ -247,15 +242,20 @@ func (plugin *rdmaCniPlugin) CmdAdd(args *skel.CmdArgs) error {
 	}
 	log.Debug().Msgf("rdmaDev: %s, origRdmaDev: %s", rdmaDev, origRdmaDev)
 
-	// Modify custom RDMA device name through the CNI args
-	err = plugin.setRdmaDevName(origRdmaDev, rdmaDev)
+	// Move RDMA device to container namespace using its original hardware name.
+	// Renaming is deferred to inside the container namespace so that the friendly
+	// name (e.g. "rdma_net1") never exists in the root namespace.  RDMA device
+	// names are globally unique in the kernel RDMA subsystem even across network
+	// namespaces, so renaming in the root namespace causes a "file exists" error
+	// when two pods share the same CNI interface name (e.g. both use "net1").
+	err = plugin.moveRdmaDevToNs(origRdmaDev, args.Netns)
+	if err != nil {
+		return fmt.Errorf("failed to move RDMA device %s to namespace. %v", origRdmaDev, err)
+	}
+	// Rename RDMA device inside the container namespace
+	err = plugin.setRdmaDevNameInNs(args.Netns, origRdmaDev, rdmaDev)
 	if err != nil {
 		return fmt.Errorf("failed to set RDMA device %s name: %w", rdmaDev, err)
-	}
-	// Move RDMA device to container namespace
-	err = plugin.moveRdmaDevToNs(rdmaDev, args.Netns)
-	if err != nil {
-		return fmt.Errorf("failed to move RDMA device %s to namespace. %v", rdmaDev, err)
 	}
 	// set RDMA device TOS in container namespace
 	err = plugin.setRdmaDevQoS(args.Netns, rdmaDev, rdmatypes.RDMAQoS{TOS: qos.TOS, TC: 0})
@@ -274,12 +274,15 @@ func (plugin *rdmaCniPlugin) CmdAdd(args *skel.CmdArgs) error {
 	pRef := plugin.stateCache.GetStateRef(conf.Name, args.ContainerID, args.IfName)
 	err = plugin.stateCache.Save(pRef, &state)
 	if err != nil {
-		// Move RDMA dev back to current namespace
+		// Move RDMA dev back to root namespace, then restore its original name
 		restoreErr := plugin.moveRdmaDevFromNs(state.ContainerRdmaDevName, args.Netns)
 		if restoreErr != nil {
 			return fmt.Errorf(
 				"save to cache failed %v, failed while restoring namespace for RDMA device %s. %v",
 				err, rdmaDev, restoreErr)
+		}
+		if nameErr := plugin.setRdmaDevName(rdmaDev, origRdmaDev); nameErr != nil {
+			log.Warn().Msgf("failed to restore RDMA device name %s -> %s: %v", rdmaDev, origRdmaDev, nameErr)
 		}
 		return err
 	}
@@ -317,10 +320,10 @@ func (plugin *rdmaCniPlugin) CmdDel(args *skel.CmdArgs) error {
 		return nil
 	}
 
-	// Move RDMA device to default namespace
-	// upon RDMA device restore, the RDMA device name will be set to its original name
-	// revoking custom RDMA device name applied in container network namespace.
+	// Move RDMA device to default namespace; the device arrives with its friendly name
+	// (e.g. "rdma_net1") and is renamed back to the original hardware name below.
 	rdmaDev := rdmaState.ContainerRdmaDevName
+	skipRdmaDeviceRestore := false
 	err = plugin.moveRdmaDevFromNs(rdmaDev, args.Netns)
 	if err != nil {
 		// if RDMA device is not found in container namespace, device was probably removed by a preceding cni CMD_DEL call
@@ -345,7 +348,7 @@ func (plugin *rdmaCniPlugin) CmdDel(args *skel.CmdArgs) error {
 	log.Info().Msgf("RDMA device %s QoS: %+v", rdmaDev, rdmaState.RDMAQoS)
 
 	if !skipRdmaDeviceRestore {
-		// Restore root namespace RDMA device name stored in cache
+		// Restore the original hardware name in root namespace
 		err = plugin.setRdmaDevName(rdmaState.ContainerRdmaDevName, rdmaState.SandboxRdmaDevName)
 		if err != nil {
 			return fmt.Errorf("failed to set RDMA device %s name: %w", rdmaState.ContainerRdmaDevName, err)
@@ -359,10 +362,10 @@ func (plugin *rdmaCniPlugin) CmdDel(args *skel.CmdArgs) error {
 	return nil
 }
 
-// getRDMADevice returns CNI interface name or user provided name as the RDMA device name.
-// Original RDMA device name is returned to restore the RDMA device name upon CmdDel.
-func (plugin *rdmaCniPlugin) getRDMADevice(rdmaDeviceName,
-	ifName, deviceID string) (string, string, error) {
+// getRDMADevice returns the RDMA device name to use inside the container and the original
+// hardware name (used to restore upon CmdDel). By default the hardware name is kept as-is;
+// an explicit rdmaDeviceName overrides it (caller must ensure global uniqueness).
+func (plugin *rdmaCniPlugin) getRDMADevice(rdmaDeviceName, deviceID string) (string, string, error) {
 	var (
 		rdmaDevs    []string
 		origRdmaDev string
@@ -388,10 +391,13 @@ func (plugin *rdmaCniPlugin) getRDMADevice(rdmaDeviceName,
 	// original RDMA device name is the first RDMA device found
 	origRdmaDev = rdmaDevs[0]
 
-	// use CNI interface name or user provided name as the RDMA device name
-	if ifName != "" {
-		rdmaDevs[0] = rdmaDevPrefix + ifName
-	}
+	// Apply user-provided custom RDMA device name if given.
+	// Note: RDMA device names are globally unique in the kernel even across
+	// network namespaces (exclusive mode). Auto-deriving a name from the CNI
+	// interface name (e.g. "net1" → "rdma_net1") is therefore unsafe when
+	// multiple pods share the same interface name, as the second pod's rename
+	// will always fail with EEXIST. When rdmaDeviceName is set the caller is
+	// responsible for ensuring the name is unique across all pods on the node.
 	if rdmaDeviceName != "" {
 		rdmaDevs[0] = rdmaDeviceName
 	}
@@ -399,11 +405,9 @@ func (plugin *rdmaCniPlugin) getRDMADevice(rdmaDeviceName,
 	return rdmaDevs[0], origRdmaDev, nil
 }
 
-// setRdmaDevName sets the RDMA device name according to rdmaDevPrefix + netdevice
-// or user defined RDMA device name provided in the CNI args.
+// setRdmaDevName renames an RDMA device in the current (root) namespace.
 func (plugin *rdmaCniPlugin) setRdmaDevName(origRdmaDev, rdmaDev string) error {
 	if origRdmaDev == rdmaDev {
-		// do nothing
 		return nil
 	}
 	err := plugin.rdmaManager.SetRdmaDevName(origRdmaDev, rdmaDev)
@@ -415,6 +419,23 @@ func (plugin *rdmaCniPlugin) setRdmaDevName(origRdmaDev, rdmaDev string) error {
 		return fmt.Errorf("failed to set RDMA device %s name to %s: %w", origRdmaDev, rdmaDev, err)
 	}
 	return nil
+}
+
+// setRdmaDevNameInNs renames an RDMA device inside the given network namespace.
+// Renaming inside the container namespace avoids conflicts in the root namespace
+// when multiple pods share the same CNI interface name.
+func (plugin *rdmaCniPlugin) setRdmaDevNameInNs(nsPath, origRdmaDev, rdmaDev string) error {
+	if origRdmaDev == rdmaDev {
+		return nil
+	}
+	targetNs, err := plugin.nsManager.GetNS(nsPath)
+	if err != nil {
+		return fmt.Errorf("failed to open network namespace %s: %v", nsPath, err)
+	}
+	defer targetNs.Close()
+	return targetNs.Do(func(_ ns.NetNS) error {
+		return plugin.rdmaManager.SetRdmaDevName(origRdmaDev, rdmaDev)
+	})
 }
 
 // setRdmaDevQoS sets the RDMA device QoS in the given network namespace
